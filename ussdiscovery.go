@@ -10,6 +10,7 @@ import (
     "strings"
     "sync"
     "time"
+    "ussdiscovery/discovery"
 )
 func normUSN(s string) string {
     s = strings.TrimSpace(s)
@@ -36,15 +37,15 @@ type Discovery struct {
 }
 
 type SSDPDevice struct {
-    USN        string   // normalized uuid (lowercase, no 'uuid:')
-    STs        []string // unique list of search targets
-    Server     string
-    Location   string
-    CacheCtrl  string
-    LastAddr   string
-    Friendly   string // optional (from device.xml)
-    Model      string // optional (from device.xml)
-    Maker      string // optional (from device.xml)
+    USN       string   // normalized uuid (lowercase, no 'uuid:')
+    ST        string   // single search target (αυτό χρησιμοποιείς στον κώδικα)
+    Server    string
+    Location  string
+    CacheCtrl string
+    LastAddr  string
+    Friendly  string // optional (from device.xml)
+    Model     string // optional (from device.xml)
+    Maker     string // optional (from device.xml)
 }
 
 type WSDevice struct {
@@ -106,11 +107,24 @@ func (d *Discovery) ProcessSSDP(dev *SSDPDevice) bool {
     d.mu.Lock(); defer d.mu.Unlock()
     key := dev.USN
     prev, ok := d.ssdpSeen[key]
-    if !ok || *prev != *dev {
+    if !ok || !ssdpEqual(prev, dev) {
         d.ssdpSeen[key] = dev
         return true
     }
     return false
+}
+
+func ssdpEqual(a, b *SSDPDevice) bool {
+    if a == nil || b == nil { return a == b }
+    return a.USN == b.USN &&
+        a.ST == b.ST &&
+        a.Server == b.Server &&
+        a.Location == b.Location &&
+        a.CacheCtrl == b.CacheCtrl &&
+        a.LastAddr == b.LastAddr &&
+        a.Friendly == b.Friendly &&
+        a.Model == b.Model &&
+        a.Maker == b.Maker
 }
 func (d *Discovery) ProcessWSD(dev *WSDevice) bool {
     d.mu.Lock(); defer d.mu.Unlock()
@@ -242,73 +256,21 @@ func listenWSD(c *net.UDPConn, disc *Discovery) {
     }
 }
 
+var KnownPrivateCIDRs = []string{
+    "10.23.140.0/24",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
 
-
-func main() {
-    fmt.Println("Starting UBNT & Mikrotik Discovery...")
-
-    localIPs := getLocalIPs()
-    fmt.Println("Local IPs detected:", localIPs)
-
-    // start listeners on each port
-    var listeners []net.PacketConn
-    for _, port := range ports {
-        pc, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port))
-        if err != nil {
-            fmt.Printf("Failed to bind port %d: %v\n", port, err)
-            continue
-        }
-        listeners = append(listeners, pc)
-    }
-
-    disc := NewDiscovery() // your seen‐cache
-	
-	
-
-    // spawn a goroutine per listener
-    var wg sync.WaitGroup
-    for _, pc := range listeners {
-        wg.Add(1)
-        go func(p net.PacketConn) {
-            defer wg.Done()
-            listenAndParse(p, localIPs, disc)
-        }(pc)
-    }
-
-// SSDP (239.255.255.250:1900)
-if ssdpConns, err := listenAllMulticast("239.255.255.250", 1900); err == nil {
-    for _, c := range ssdpConns {
-        wg.Add(1)
-        go func(conn *net.UDPConn) {
-            defer wg.Done()
-            listenSSDP(conn, disc)
-        }(c)
-    }
-} else {
-    fmt.Println("SSDP multicast failed:", err)
 }
 
-// WS-Discovery (239.255.255.250:3702)
-if wsdConns, err := listenAllMulticast("239.255.255.250", 3702); err == nil {
-    for _, c := range wsdConns {
-        wg.Add(1)
-        go func(conn *net.UDPConn) {
-            defer wg.Done()
-            listenWSD(conn, disc)
-        }(c)
-    }
-} else {
-    fmt.Println("WSD multicast failed:", err)
+var scannedSubnets sync.Map // subnet CIDR -> struct{}
+var seenHosts sync.Map      // ip -> struct{}
+
+func markNewHost(ip string) bool {
+    _, loaded := seenHosts.LoadOrStore(ip, struct{}{})
+    return !loaded // true μόνο την 1η φορά
 }
 
-    // periodically fire off discovery packets
-    ticker := time.NewTicker(10 * time.Second)
-    defer ticker.Stop()
-    for {
-        sendDiscovery(disc)
-        <-ticker.C
-    }
-}
 
 func sendDiscovery(disc *Discovery) {
     // ---- UBNT & Grandstream probes ----
@@ -500,4 +462,112 @@ func contains(slice []string, item string) bool {
         }
     }
     return false
+}
+
+
+
+
+
+
+
+
+
+
+func main() {
+    fmt.Println("Starting UBNT & Mikrotik Discovery...")
+
+    localIPs := getLocalIPs()
+    fmt.Println("Local IPs detected:", localIPs)
+
+    // --- UDP listeners for discovery replies ---
+    var listeners []net.PacketConn
+    for _, port := range ports {
+        pc, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port))
+        if err != nil {
+            fmt.Printf("Failed to bind port %d: %v\n", port, err)
+            continue
+        }
+        listeners = append(listeners, pc)
+    }
+
+    disc := NewDiscovery()
+
+    // spawn a goroutine per UDP listener
+    var wg sync.WaitGroup
+    for _, pc := range listeners {
+        wg.Add(1)
+        go func(p net.PacketConn) {
+            defer wg.Done()
+            listenAndParse(p, localIPs, disc)
+        }(pc)
+    }
+
+    // ---- SSDP (239.255.255.250:1900) listeners on all multicast-capable ifaces ----
+    if ssdpConns, err := listenAllMulticast("239.255.255.250", 1900); err == nil {
+        for _, c := range ssdpConns {
+            wg.Add(1)
+            go func(conn *net.UDPConn) {
+                defer wg.Done()
+                listenSSDP(conn, disc)
+            }(c)
+        }
+    } else {
+        fmt.Println("SSDP multicast failed:", err)
+    }
+
+    // ---- WS-Discovery (239.255.255.250:3702) ----
+    if wsdConns, err := listenAllMulticast("239.255.255.250", 3702); err == nil {
+        for _, c := range wsdConns {
+            wg.Add(1)
+            go func(conn *net.UDPConn) {
+                defer wg.Done()
+                listenWSD(conn, disc)
+            }(c)
+        }
+    } else {
+        fmt.Println("WSD multicast failed:", err)
+    }
+
+    // -------------------------------------------------------
+    // Subnet Hunter (separate logs, dedup per-subnet & per-host)
+    // -------------------------------------------------------
+    fmt.Println("Starting Subnet Hunter on private ranges...")
+    results := make(chan discovery.HunterResult, 1024)
+
+    // producer: run hunter for each known private CIDR
+    go func() {
+        for _, cidr := range KnownPrivateCIDRs {
+            discovery.SubnetHunter(cidr, results)
+        }
+        close(results)
+    }()
+
+    // consumer: scan each candidate subnet once; print each host once
+    go func() {
+        for r := range results {
+            if _, loaded := scannedSubnets.LoadOrStore(r.Subnet, struct{}{}); loaded {
+                // subnet already scanned or in-progress
+                continue
+            }
+
+            fmt.Printf("\n=== HUNTER Results for %s ===\n", r.Subnet)
+
+            discovery.ScanSubnet(r.Subnet, func(ip string) {
+                if markNewHost(ip) {
+                    fmt.Printf("[HOST] %s\n", ip)
+                }
+            })
+
+            fmt.Println("=== End HUNTER ===\n")
+        }
+    }()
+    // -------------------------------------------------------
+
+    // periodic discovery broadcasts
+    ticker := time.NewTicker(10 * time.Second)
+    defer ticker.Stop()
+    for {
+        sendDiscovery(disc)
+        <-ticker.C
+    }
 }
