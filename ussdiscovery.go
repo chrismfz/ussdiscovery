@@ -281,6 +281,7 @@ var KnownPrivateCIDRs = []string{
 
 var scannedSubnets sync.Map // subnet CIDR -> struct{}
 var seenHosts sync.Map      // ip -> struct{}
+var printedFP sync.Map      // ip -> last printed fingerprint line
 
 func markNewHost(ip string) bool {
 	_, loaded := seenHosts.LoadOrStore(ip, struct{}{})
@@ -359,6 +360,22 @@ func nudgeUBNTviaTCP(ip string) {
 // NEW: TCP fingerprint helpers
 // ---------------------------
 
+// κρατά μόνο printable ASCII και κόβει στην πρώτη γραμμή
+func sanitizeBanner(s string) string {
+	// κόψε στην πρώτη γραμμή
+	if i := strings.IndexAny(s, "\r\n"); i >= 0 {
+		s = s[:i]
+	}
+	// φιλτράρισε printable (32..126) + tabs
+	var b strings.Builder
+	for _, r := range s {
+		if r == '\t' || (r >= 32 && r <= 126) {
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
 // Γρήγορος TCP "is open?"
 func tcpOpen(ip string, port int, d time.Duration) bool {
 	c, err := net.DialTimeout("tcp", net.JoinHostPort(ip, fmt.Sprint(port)), d)
@@ -369,7 +386,7 @@ func tcpOpen(ip string, port int, d time.Duration) bool {
 	return false
 }
 
-// Διάβασε SSH banner (μέχρι 64 bytes) χωρίς να στείλεις τίποτα
+// Διάβασε SSH banner (μέχρι ~256 bytes) και καθάρισέ το
 func sshBanner(ip string, d time.Duration) (string, error) {
 	c, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "22"), d)
 	if err != nil {
@@ -377,12 +394,12 @@ func sshBanner(ip string, d time.Duration) (string, error) {
 	}
 	defer c.Close()
 	_ = c.SetReadDeadline(time.Now().Add(d))
-	buf := make([]byte, 64)
-	n, err := c.Read(buf)
-	if n > 0 {
-		return string(buf[:n]), nil
+	var buf [256]byte
+	n, err := c.Read(buf[:])
+	if n <= 0 {
+		return "", err
 	}
-	return "", err
+	return sanitizeBanner(string(buf[:n])), nil
 }
 
 // Πάρε HTTP Server header (HEAD /) σε 80
@@ -408,6 +425,15 @@ func httpServerHeader(ip string, port int, d time.Duration) (string, error) {
 	return "", nil
 }
 
+func shortenServerHeader(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 40 {
+		s = s[:40]
+	}
+	return s
+}
+
 func classifyByTCP(ip string) (kind string, hints []string) {
 	// 10001/tcp => ισχυρό hint για UBNT
 	if tcpOpen(ip, 10001, 250*time.Millisecond) {
@@ -419,24 +445,25 @@ func classifyByTCP(ip string) (kind string, hints []string) {
 	if b, err := sshBanner(ip, 300*time.Millisecond); err == nil && b != "" {
 		lb := strings.ToLower(b)
 		if strings.Contains(lb, "rosssh") || strings.Contains(lb, "mikrotik") {
-			hints = append(hints, "ssh:"+strings.TrimSpace(b))
+			hints = append(hints, "ssh:"+b)
 			if kind == "" {
 				kind = "MikroTik"
 			}
 		} else {
-			hints = append(hints, "ssh:"+strings.TrimSpace(b))
+			hints = append(hints, "ssh:"+b)
 		}
 	}
 
 	// HTTP server header (80)
 	if srv, err := httpServerHeader(ip, 80, 400*time.Millisecond); err == nil && srv != "" {
 		ls := strings.ToLower(srv)
+		srv = shortenServerHeader(srv)
 		if strings.Contains(ls, "mikrotik") || strings.Contains(ls, "routeros") {
 			hints = append(hints, "http:server="+srv)
 			if kind == "" {
 				kind = "MikroTik"
 			}
-		} else if strings.Contains(ls, "ubnt") || strings.Contains(ls, "air") || strings.Contains(ls, "unifi") {
+		} else if strings.Contains(ls, "ubnt") || strings.Contains(ls, "air") || strings.Contains(ls, "unifi") || strings.Contains(ls, "lighttpd") {
 			hints = append(hints, "http:server="+srv)
 			if kind == "" {
 				kind = "UBNT"
@@ -452,6 +479,41 @@ func classifyByTCP(ip string) (kind string, hints []string) {
 	return
 }
 
+// ---------------------------
+// NEW: TCP-based UBNT probe
+// ---------------------------
+
+func tcpProbeUBNT(ip string, disc *Discovery) {
+	// Αν η πόρτα δεν είναι ανοιχτή, μην ενοχλείς
+	if !tcpOpen(ip, 10001, 200*time.Millisecond) {
+		return
+	}
+	addr := net.JoinHostPort(ip, "10001")
+	c, err := net.DialTimeout("tcp", addr, 400*time.Millisecond)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(600 * time.Millisecond))
+
+	// στείλε το κλασικό discovery payload (ίδιο με UDP)
+	_, _ = c.Write([]byte{1, 0, 0, 0})
+
+	// διάβασε απάντηση (UBNT συνήθως στέλνει μικρό packet)
+	buf := make([]byte, 2048)
+	n, err := c.Read(buf)
+	if n <= 0 || err != nil {
+		return
+	}
+	// προσπάθησε να το περάσεις από τον ίδιο parser
+	if dev := parseUBNTPacket(buf[:n]); dev != nil {
+		if disc.ProcessUBNT(dev) {
+			fmt.Printf("[UBNT/TCP] IP: %s | MAC: %s | Hostname: %s | Model: %s | Platform: %s | Version: %s\n",
+				dev.IP, dev.MAC, dev.Hostname, dev.Model, dev.Platform, dev.Version)
+		}
+	}
+}
+
 func sendDiscovery(disc *Discovery) {
 	// ---- UBNT & Grandstream probes (broadcast) FROM listening ports ----
 	msg := []byte{1, 0, 0, 0}
@@ -460,7 +522,7 @@ func sendDiscovery(disc *Discovery) {
 	// Grandstream
 	sendFromListeningPort(10000, msg, "255.255.255.255:10000")
 
-	// ---- SSDP M-SEARCH (define BEFORE using) ----
+	// ---- SSDP M-SEARCH ----
 	ssdpStr := "M-SEARCH * HTTP/1.1\r\n" +
 		"HOST: 239.255.255.250:1900\r\n" +
 		"MAN: \"ssdp:discover\"\r\n" +
@@ -480,7 +542,6 @@ func sendDiscovery(disc *Discovery) {
 			if err != nil {
 				break
 			}
-			// reuse SSDP header parse
 			lines := strings.Split(string(buf[:n]), "\r\n")
 			hdr := map[string]string{}
 			for _, ln := range lines[1:] {
@@ -513,7 +574,7 @@ func sendDiscovery(disc *Discovery) {
 		_ = c.Close()
 	}
 
-	// ---- WS-Discovery Probe (unchanged) ----
+	// ---- WS-Discovery Probe ----
 	probe := `<?xml version="1.0" encoding="UTF-8"?>
 <e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
 xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing"
@@ -742,10 +803,15 @@ func main() {
 					// προαιρετικό TCP nudge – αν 10001/tcp είναι open, ξαναστείλε UDP
 					nudgeUBNTviaTCP(ip)
 
+					// Αν 10001/tcp είναι ανοιχτό, δοκίμασε και TCP-based UBNT discovery (cross-subnet)
+					tcpProbeUBNT(ip, disc)
+
 					// ---- TCP fingerprint fallback (cross-subnet friendly) ----
 					kind, hints := classifyByTCP(ip)
-					if kind != "Unknown" || len(hints) > 0 {
-						fmt.Printf("[FINGERPRINT] %s -> %s | %s\n", ip, kind, strings.Join(hints, "; "))
+					line := fmt.Sprintf("[FINGERPRINT] %s -> %s | %s", ip, kind, strings.Join(hints, "; "))
+					if prev, _ := printedFP.Load(ip); prev != line {
+						fmt.Println(line)
+						printedFP.Store(ip, line)
 					}
 				}
 			})
@@ -771,7 +837,7 @@ func main() {
 	}()
 
 	// periodic discovery broadcasts
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(30 * time.Second) // λίγο πιο χαλαρά για να μην φορτώνει το δίκτυο
 	defer ticker.Stop()
 	for {
 		sendDiscovery(disc)
