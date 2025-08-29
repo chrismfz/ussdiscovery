@@ -1,18 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"fmt"
 	"html"
 	"net"
+	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
-	"bytes"
-	"sort"
-	"net/url"
 
 	"ussdiscovery/discovery"
 )
@@ -20,89 +20,94 @@ import (
 // --- Pretty printing & sorting helpers ---
 
 type displayItem struct {
-    ip    string
-    kind  string   // MikroTik, UBNT, Unknown
-    hints []string // tcp/10001 open; ssh:...; http:server=...
+	ip    string
+	kind  string   // MikroTik, UBNT, Camera(Hikvision), Camera(Dahua), Unknown
+	hints []string // tcp/10001 open; ssh:...; http:server=...; http:88 realm=...; rtsp:server=...
 }
 
 func ipLess(a, b string) bool {
-    ipa := net.ParseIP(a)
-    ipb := net.ParseIP(b)
-    if ipa == nil || ipb == nil {
-        return a < b
-    }
-    // Προτιμάμε v4 πριν από v6, και μετά byte-compare
-    a4 := ipa.To4()
-    b4 := ipb.To4()
-    if (a4 != nil) != (b4 != nil) {
-        return a4 != nil // v4 πριν το v6
-    }
-    if a4 != nil && b4 != nil {
-        return bytes.Compare(a4, b4) < 0
-    }
-    return bytes.Compare(ipa, ipb) < 0
+	ipa := net.ParseIP(a)
+	ipb := net.ParseIP(b)
+	if ipa == nil || ipb == nil {
+		return a < b
+	}
+	a4 := ipa.To4()
+	b4 := ipb.To4()
+	if (a4 != nil) != (b4 != nil) {
+		return a4 != nil // v4 πριν το v6
+	}
+	if a4 != nil && b4 != nil {
+		return bytes.Compare(a4, b4) < 0
+	}
+	return bytes.Compare(ipa, ipb) < 0
 }
 
 func kindOrder(kind string) int {
-    switch kind {
-    case "MikroTik":
-        return 0
-    case "UBNT":
-        return 1
-    default:
-        return 2
-    }
+	switch kind {
+	case "MikroTik":
+		return 0
+	case "UBNT":
+		return 1
+	case "Camera(Hikvision)":
+		return 2
+	case "Camera(Dahua)":
+		return 3
+	default:
+		return 4
+	}
 }
 
 // Θεωρούμε “ουσιαστικό” fingerprint αν:
-// - αναγνωρίστηκε kind (UBNT/MikroTik) ή
-// - υπάρχουν hints με χρησιμότητα (ssh banner, http server, open ports)
+// - αναγνωρίστηκε kind (όχι Unknown) ή
+// - υπάρχουν hints με χρησιμότητα (ssh banner, http server/realm, rtsp, open sdk ports)
 func isInteresting(kind string, hints []string) bool {
-    if kind != "Unknown" {
-        return true
-    }
-    return len(hints) > 0
+	if kind != "Unknown" {
+		return true
+	}
+	return len(hints) > 0
 }
 
+// --- SSDP dedup / normalization ---
+
+var seenSSDP sync.Map                   // key=stable id -> last time printed
+const ssdpSuppress = 10 * time.Minute   // μην ξανατυπωθεί πριν περάσει αυτό το διάστημα
+
 func ssdpShouldPrint(key string) bool {
-    if key == "" {
-        return false
-    }
-    now := time.Now()
-    if v, ok := seenSSDP.Load(key); ok {
-        if t, ok2 := v.(time.Time); ok2 {
-            if now.Sub(t) < ssdpSuppress { // εντός παραθύρου καταστολής
-                return false
-            }
-        }
-    }
-    seenSSDP.Store(key, now)
-    return true
+	if key == "" {
+		return false
+	}
+	now := time.Now()
+	if v, ok := seenSSDP.Load(key); ok {
+		if t, ok2 := v.(time.Time); ok2 {
+			if now.Sub(t) < ssdpSuppress {
+				return false
+			}
+		}
+	}
+	seenSSDP.Store(key, now)
+	return true
 }
 
 func normUSN(s string) string {
-    s = strings.TrimSpace(strings.ToLower(s))
-    if i := strings.Index(s, "::"); i >= 0 {
-        s = s[:i] // κόψε ό,τι υπάρχει μετά το πρώτο '::'
-    }
-    s = strings.TrimPrefix(s, "uuid:")
-    return s
+	s = strings.TrimSpace(strings.ToLower(s))
+	if i := strings.Index(s, "::"); i >= 0 {
+		s = s[:i] // κόψε ό,τι υπάρχει μετά το πρώτο '::'
+	}
+	s = strings.TrimPrefix(s, "uuid:")
+	return s
 }
 
 func ssdpKey(usn, location, lastIP string) string {
-    // 1) Προτίμησε normalized USN (σταθερό ανά device)
-    if k := normUSN(usn); k != "" {
-        return "usn:" + k
-    }
-    // 2) Αλλιώς πάρε host από Location (συνήθως IP)
-    if u, err := url.Parse(location); err == nil && u != nil && u.Hostname() != "" {
-        return "loc:" + u.Hostname()
-    }
-    // 3) Τελευταίο fallback: η IP που απάντησε
-    if lastIP != "" {
-        return "ip:" + lastIP
-    }
-    return ""
+	if k := normUSN(usn); k != "" {
+		return "usn:" + k
+	}
+	if u, err := url.Parse(location); err == nil && u != nil && u.Hostname() != "" {
+		return "loc:" + u.Hostname()
+	}
+	if lastIP != "" {
+		return "ip:" + lastIP
+	}
+	return ""
 }
 
 // ports we listen on for discovery replies
@@ -288,44 +293,41 @@ func listenAllMulticast(group string, port int) ([]*net.UDPConn, error) {
 	return conns, nil
 }
 
-var seenSSDP sync.Map // key=USN ή IP
-const ssdpSuppress = 10 * time.Minute // προαιρετικό: μην ξαναεκτυπώσεις πριν περάσει αυτό
-
 func listenSSDP(c *net.UDPConn, disc *Discovery) {
-    defer c.Close()
-    buf := make([]byte, 8192)
-    for {
-        n, addr, err := c.ReadFromUDP(buf)
-        if err != nil {
-            return
-        }
-        lines := strings.Split(string(buf[:n]), "\r\n")
-        hdr := map[string]string{}
-        for _, ln := range lines[1:] {
-            if i := strings.Index(ln, ":"); i > 0 {
-                k := strings.ToUpper(strings.TrimSpace(ln[:i]))
-                v := strings.TrimSpace(ln[i+1:])
-                hdr[k] = v
-            }
-        }
-        dev := &SSDPDevice{
-            USN:       hdr["USN"],
-            ST:        hdr["ST"],
-            Server:    hdr["SERVER"],
-            Location:  hdr["LOCATION"],
-            CacheCtrl: hdr["CACHE-CONTROL"],
-            LastAddr:  addr.IP.String(),
-        }
+	defer c.Close()
+	buf := make([]byte, 8192)
+	for {
+		n, addr, err := c.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		lines := strings.Split(string(buf[:n]), "\r\n")
+		hdr := map[string]string{}
+		for _, ln := range lines[1:] {
+			if i := strings.Index(ln, ":"); i > 0 {
+				k := strings.ToUpper(strings.TrimSpace(ln[:i]))
+				v := strings.TrimSpace(ln[i+1:])
+				hdr[k] = v
+			}
+		}
+		dev := &SSDPDevice{
+			USN:       hdr["USN"],
+			ST:        hdr["ST"],
+			Server:    hdr["SERVER"],
+			Location:  hdr["LOCATION"],
+			CacheCtrl: hdr["CACHE-CONTROL"],
+			LastAddr:  addr.IP.String(),
+		}
 
-        // φτιάξε stable key & έλεγξε rate-limited dedup
-        key := ssdpKey(dev.USN, dev.Location, dev.LastAddr)
-        if !ssdpShouldPrint(key) {
-            continue
-        }
+		// stable key & rate-limited dedup
+		key := ssdpKey(dev.USN, dev.Location, dev.LastAddr)
+		if !ssdpShouldPrint(key) {
+			continue
+		}
 
-        // μόνο IP — όσο πιο “στεγνό”, τόσο λιγότερο noise
-        fmt.Printf("[SSDP] %s\n", addr.IP.String())
-    }
+		// μόνο IP — όσο πιο “στεγνό”, τόσο λιγότερο noise
+		fmt.Printf("[SSDP] %s\n", addr.IP.String())
+	}
 }
 
 var (
@@ -360,14 +362,14 @@ func listenWSD(c *net.UDPConn, disc *Discovery) {
 	}
 }
 
+// Seed CIDRs — μπορείς να τα αφήσεις λίγα/ενδεικτικά.
+// Θα προστεθούν ΑΥΤΟΜΑΤΑ και τα /24 των local IPs.
 var KnownPrivateCIDRs = []string{
 	"10.23.140.0/24",
 	"192.168.0.0/24",
 	"192.168.1.0/24",
 	"192.168.2.0/24",
 	"192.168.88.0/24",
-		
-	
 }
 
 var scannedSubnets sync.Map // subnet CIDR -> struct{}
@@ -394,7 +396,6 @@ func sendFromListeningPort(port int, payload []byte, addr string) {
 // NEW: subnet “poke” helpers
 // ---------------------------
 
-// compute directed broadcast for a CIDR (support /24 primary use)
 func cidrBroadcast(cidr string) (string, bool) {
 	_, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
@@ -415,15 +416,12 @@ func cidrBroadcast(cidr string) (string, bool) {
 func pokeUBNTSubnet(subnet string) {
 	if b, ok := cidrBroadcast(subnet); ok {
 		msg := []byte{1, 0, 0, 0}
-		// directed broadcast
-		sendFromListeningPort(10001, msg, net.JoinHostPort(b, "10001"))
-		// και global broadcast (μερικά stacks απαντούν μόνο έτσι)
-		sendFromListeningPort(10001, msg, "255.255.255.255:10001")
+		sendFromListeningPort(10001, msg, net.JoinHostPort(b, "10001"))           // directed broadcast
+		sendFromListeningPort(10001, msg, "255.255.255.255:10001")                // global broadcast
 	}
 }
 
 func pokeMNDPSubnet(subnet string) {
-	// MikroTik MNDP (UDP/5678) — απλά στείλε κάτι σε broadcast
 	if b, ok := cidrBroadcast(subnet); ok {
 		sendFromListeningPort(5678, []byte{0}, net.JoinHostPort(b, "5678"))
 		sendFromListeningPort(5678, []byte{0}, "255.255.255.255:5678")
@@ -441,7 +439,6 @@ func isOpenTCP(addr string, timeout time.Duration) bool {
 }
 
 func nudgeUBNTviaTCP(ip string) {
-	// Αν 10001/tcp είναι ανοιχτό, στείλε ξανά UDP probe από το listening port
 	if isOpenTCP(net.JoinHostPort(ip, "10001"), 300*time.Millisecond) {
 		probeUBNT(ip)
 	}
@@ -451,13 +448,10 @@ func nudgeUBNTviaTCP(ip string) {
 // NEW: TCP fingerprint helpers
 // ---------------------------
 
-// κρατά μόνο printable ASCII και κόβει στην πρώτη γραμμή
 func sanitizeBanner(s string) string {
-	// κόψε στην πρώτη γραμμή
 	if i := strings.IndexAny(s, "\r\n"); i >= 0 {
 		s = s[:i]
 	}
-	// φιλτράρισε printable (32..126) + tabs
 	var b strings.Builder
 	for _, r := range s {
 		if r == '\t' || (r >= 32 && r <= 126) {
@@ -467,7 +461,6 @@ func sanitizeBanner(s string) string {
 	return strings.TrimSpace(b.String())
 }
 
-// Γρήγορος TCP "is open?"
 func tcpOpen(ip string, port int, d time.Duration) bool {
 	c, err := net.DialTimeout("tcp", net.JoinHostPort(ip, fmt.Sprint(port)), d)
 	if err == nil {
@@ -477,7 +470,6 @@ func tcpOpen(ip string, port int, d time.Duration) bool {
 	return false
 }
 
-// Διάβασε SSH banner (μέχρι ~256 bytes) και καθάρισέ το
 func sshBanner(ip string, d time.Duration) (string, error) {
 	c, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "22"), d)
 	if err != nil {
@@ -493,7 +485,6 @@ func sshBanner(ip string, d time.Duration) (string, error) {
 	return sanitizeBanner(string(buf[:n])), nil
 }
 
-// Πάρε HTTP Server header (HEAD /) σε 80
 func httpServerHeader(ip string, port int, d time.Duration) (string, error) {
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, fmt.Sprint(port)), d)
 	if err != nil {
@@ -505,12 +496,41 @@ func httpServerHeader(ip string, port int, d time.Duration) (string, error) {
 	if _, err := conn.Write([]byte(req)); err != nil {
 		return "", err
 	}
-	buf := make([]byte, 1024)
+	buf := make([]byte, 2048)
 	n, _ := conn.Read(buf)
-	s := strings.ToLower(string(buf[:n]))
+	s := string(buf[:n])
 	for _, line := range strings.Split(s, "\r\n") {
-		if strings.HasPrefix(line, "server:") {
-			return strings.TrimSpace(line[len("server:"):]), nil
+		if strings.HasPrefix(strings.ToLower(line), "server:") {
+			return strings.TrimSpace(line[len("Server:"):]), nil
+		}
+	}
+	return "", nil
+}
+
+func httpAuthRealm(ip string, port int, d time.Duration) (string, error) {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, fmt.Sprint(port)), d)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(d))
+	req := "HEAD / HTTP/1.1\r\nHost: " + ip + "\r\nUser-Agent: ussdiscovery/1.0\r\nConnection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return "", err
+	}
+	buf := make([]byte, 2048)
+	n, _ := conn.Read(buf)
+	s := string(buf[:n])
+	for _, line := range strings.Split(s, "\r\n") {
+		if strings.HasPrefix(strings.ToLower(line), "www-authenticate:") {
+			low := strings.ToLower(line)
+			if idx := strings.Index(low, `realm="`); idx >= 0 {
+				rest := line[idx+len(`realm="`):]
+				if j := strings.Index(rest, `"`); j >= 0 {
+					return rest[:j], nil
+				}
+			}
+			return strings.TrimSpace(line[len("WWW-Authenticate:"):]), nil
 		}
 	}
 	return "", nil
@@ -525,42 +545,133 @@ func shortenServerHeader(s string) string {
 	return s
 }
 
+func rtspProbe(ip string, d time.Duration) (server string, realm string, err error) {
+	conn, e := net.DialTimeout("tcp", net.JoinHostPort(ip, "554"), d)
+	if e != nil {
+		return "", "", e
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(d))
+
+	req := "OPTIONS rtsp://" + ip + "/ RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: ussdiscovery/1.0\r\n\r\n"
+	if _, e = conn.Write([]byte(req)); e != nil {
+		return "", "", e
+	}
+	buf := make([]byte, 2048)
+	n, _ := conn.Read(buf)
+	s := string(buf[:n])
+
+	for _, line := range strings.Split(s, "\r\n") {
+		l := strings.ToLower(line)
+		if strings.HasPrefix(l, "server:") && server == "" {
+			server = strings.TrimSpace(line[len("Server:"):])
+		}
+		if strings.HasPrefix(l, "www-authenticate:") && realm == "" {
+			ll := line
+			low := l
+			if idx := strings.Index(low, `realm="`); idx >= 0 {
+				rest := ll[idx+len(`realm="`):]
+				if j := strings.Index(rest, `"`); j >= 0 {
+					realm = rest[:j]
+				}
+			}
+			if realm == "" {
+				realm = strings.TrimSpace(line[len("WWW-Authenticate:"):])
+			}
+		}
+	}
+	return server, realm, nil
+}
+
 func classifyByTCP(ip string) (kind string, hints []string) {
-	// 10001/tcp => ισχυρό hint για UBNT
+	const short = 300 * time.Millisecond
+
+	// UBNT
 	if tcpOpen(ip, 10001, 250*time.Millisecond) {
 		hints = append(hints, "tcp/10001 open")
-		kind = "UBNT"
+		if kind == "" {
+			kind = "UBNT"
+		}
 	}
 
 	// SSH banner
 	if b, err := sshBanner(ip, 300*time.Millisecond); err == nil && b != "" {
 		lb := strings.ToLower(b)
-		if strings.Contains(lb, "rosssh") || strings.Contains(lb, "mikrotik") {
-			hints = append(hints, "ssh:"+b)
-			if kind == "" {
+		hints = append(hints, "ssh:"+b)
+		if kind == "" {
+			if strings.Contains(lb, "rosssh") || strings.Contains(lb, "mikrotik") {
 				kind = "MikroTik"
 			}
-		} else {
-			hints = append(hints, "ssh:"+b)
 		}
 	}
 
-	// HTTP server header (80)
-	if srv, err := httpServerHeader(ip, 80, 400*time.Millisecond); err == nil && srv != "" {
-		ls := strings.ToLower(srv)
-		srv = shortenServerHeader(srv)
-		if strings.Contains(ls, "mikrotik") || strings.Contains(ls, "routeros") {
-			hints = append(hints, "http:server="+srv)
-			if kind == "" {
-				kind = "MikroTik"
+	// HTTP server/realm σε 80, 88, 8080
+	for _, p := range []int{80, 88, 8080} {
+		if tcpOpen(ip, p, short) {
+			if srv, err := httpServerHeader(ip, p, 400*time.Millisecond); err == nil && srv != "" {
+				ls := strings.ToLower(srv)
+				srvShort := shortenServerHeader(srv)
+				hints = append(hints, fmt.Sprintf("http:%d server=%s", p, srvShort))
+
+				if kind == "" {
+					switch {
+					case strings.Contains(ls, "mikrotik") || strings.Contains(ls, "routeros"):
+						kind = "MikroTik"
+					case strings.Contains(ls, "hikvision") || strings.Contains(ls, "app-webs") || strings.Contains(ls, "hik"):
+						kind = "Camera(Hikvision)"
+					case strings.Contains(ls, "dahua"):
+						kind = "Camera(Dahua)"
+					case strings.Contains(ls, "ubnt") || strings.Contains(ls, "air") || strings.Contains(ls, "unifi") || strings.Contains(ls, "lighttpd"):
+						kind = "UBNT"
+					}
+				}
 			}
-		} else if strings.Contains(ls, "ubnt") || strings.Contains(ls, "air") || strings.Contains(ls, "unifi") || strings.Contains(ls, "lighttpd") {
-			hints = append(hints, "http:server="+srv)
-			if kind == "" {
-				kind = "UBNT"
+			if realm, err := httpAuthRealm(ip, p, short); err == nil && realm != "" {
+				lr := strings.ToLower(realm)
+				hints = append(hints, fmt.Sprintf("http:%d realm=%s", p, shortenServerHeader(realm)))
+				if kind == "" {
+					switch {
+					case strings.Contains(lr, "hikvision") || strings.Contains(lr, "hik"):
+						kind = "Camera(Hikvision)"
+					case strings.Contains(lr, "dahua"):
+						kind = "Camera(Dahua)"
+					}
+				}
 			}
-		} else {
-			hints = append(hints, "http:server="+srv)
+		}
+	}
+
+	// RTSP (554)
+	if tcpOpen(ip, 554, short) {
+		srv, realm, _ := rtspProbe(ip, 500*time.Millisecond)
+		if srv != "" {
+			hints = append(hints, "rtsp:server="+shortenServerHeader(srv))
+		}
+		if realm != "" {
+			hints = append(hints, "rtsp:realm="+shortenServerHeader(realm))
+		}
+		ls := strings.ToLower(srv + " " + realm)
+		if kind == "" {
+			switch {
+			case strings.Contains(ls, "hikvision") || strings.Contains(ls, "hik"):
+				kind = "Camera(Hikvision)"
+			case strings.Contains(ls, "dahua"):
+				kind = "Camera(Dahua)"
+			}
+		}
+	}
+
+	// Vendor SDK ports (ισχυρά hints)
+	if tcpOpen(ip, 8000, short) { // Hikvision SDK
+		hints = append(hints, "tcp/8000 open")
+		if kind == "" {
+			kind = "Camera(Hikvision)"
+		}
+	}
+	if tcpOpen(ip, 37777, short) { // Dahua proprietary
+		hints = append(hints, "tcp/37777 open")
+		if kind == "" {
+			kind = "Camera(Dahua)"
 		}
 	}
 
@@ -575,7 +686,6 @@ func classifyByTCP(ip string) (kind string, hints []string) {
 // ---------------------------
 
 func tcpProbeUBNT(ip string, disc *Discovery) {
-	// Αν η πόρτα δεν είναι ανοιχτή, μην ενοχλείς
 	if !tcpOpen(ip, 10001, 200*time.Millisecond) {
 		return
 	}
@@ -587,16 +697,15 @@ func tcpProbeUBNT(ip string, disc *Discovery) {
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(600 * time.Millisecond))
 
-	// στείλε το κλασικό discovery payload (ίδιο με UDP)
+	// κλασικό discovery payload (ίδιο με UDP)
 	_, _ = c.Write([]byte{1, 0, 0, 0})
 
-	// διάβασε απάντηση (UBNT συνήθως στέλνει μικρό packet)
+	// διάβασε απάντηση
 	buf := make([]byte, 2048)
 	n, err := c.Read(buf)
 	if n <= 0 || err != nil {
 		return
 	}
-	// προσπάθησε να το περάσεις από τον ίδιο parser
 	if dev := parseUBNTPacket(buf[:n]); dev != nil {
 		if disc.ProcessUBNT(dev) {
 			fmt.Printf("[UBNT/TCP] IP: %s | MAC: %s | Hostname: %s | Model: %s | Platform: %s | Version: %s\n",
@@ -608,10 +717,8 @@ func tcpProbeUBNT(ip string, disc *Discovery) {
 func sendDiscovery(disc *Discovery) {
 	// ---- UBNT & Grandstream probes (broadcast) FROM listening ports ----
 	msg := []byte{1, 0, 0, 0}
-	// Ubiquiti
-	sendFromListeningPort(10001, msg, "255.255.255.255:10001")
-	// Grandstream
-	sendFromListeningPort(10000, msg, "255.255.255.255:10000")
+	sendFromListeningPort(10001, msg, "255.255.255.255:10001") // Ubiquiti
+	sendFromListeningPort(10000, msg, "255.255.255.255:10000") // Grandstream
 
 	// ---- SSDP M-SEARCH ----
 	ssdpStr := "M-SEARCH * HTTP/1.1\r\n" +
@@ -620,12 +727,11 @@ func sendDiscovery(disc *Discovery) {
 		"MX: 1\r\n" +
 		"ST: ssdp:all\r\n\r\n"
 
-	// send & read SSDP replies on one ephemeral socket (to catch unicast 200 OK)
+	// send & read SSDP replies on one ephemeral socket (catch unicast 200 OK)
 	if c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0}); err == nil {
 		_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		_, _ = c.WriteToUDP([]byte(ssdpStr), resolveUDP("239.255.255.250:1900"))
 
-		// read unicast replies for ~1.5s
 		_ = c.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
 		buf := make([]byte, 8192)
 		for {
@@ -650,25 +756,12 @@ func sendDiscovery(disc *Discovery) {
 				CacheCtrl: hdr["CACHE-CONTROL"],
 				LastAddr:  addr.IP.String(),
 			}
-			
-			key := ssdpKey(dev.USN, dev.Location, dev.LastAddr)
-if ssdpShouldPrint(key) {
-    fmt.Printf("[SSDP] %s\n", addr.IP.String())
-}
 
-			if dev.USN != "" || dev.Location != "" {
-				if disc.ProcessSSDP(dev) {
-					fmt.Printf("[SSDP] From=%s | %s | ST=%s | Server=%s | Location=%s\n",
-						addr.String(), dev.USN, dev.ST, dev.Server, dev.Location)
-				}
+			key := ssdpKey(dev.USN, dev.Location, dev.LastAddr)
+			if ssdpShouldPrint(key) {
+				fmt.Printf("[SSDP] %s\n", addr.IP.String())
 			}
 		}
-		_ = c.Close()
-	}
-
-	// (optional extra broadcast — can keep or remove)
-	if c, err := net.DialUDP("udp", nil, resolveUDP("239.255.255.250:1900")); err == nil {
-		_, _ = c.Write([]byte(ssdpStr))
 		_ = c.Close()
 	}
 
@@ -800,6 +893,52 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
+// --- Auto CIDR derivation (/24s for local IPv4s) ---
+
+func deriveLocalCIDRs(localIPs []string) []string {
+	set := map[string]struct{}{}
+	var out []string
+	for _, s := range localIPs {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			continue
+		}
+		ip4 := ip.To4()
+		if ip4 == nil {
+			continue
+		}
+		// x.y.z.0/24
+		cidr := fmt.Sprintf("%d.%d.%d.0/24", ip4[0], ip4[1], ip4[2])
+		if _, ok := set[cidr]; !ok {
+			set[cidr] = struct{}{}
+			out = append(out, cidr)
+		}
+	}
+	return out
+}
+
+func uniqueCIDRs(seed, extras []string) []string {
+	set := map[string]struct{}{}
+	for _, c := range seed {
+		set[c] = struct{}{}
+	}
+	for _, c := range extras {
+		if _, ok := set[c]; !ok {
+			// αγνόησε 169.254.0.0/16 autos, just in case
+			if strings.HasPrefix(c, "169.254.") {
+				continue
+			}
+			set[c] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for c := range set {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func main() {
 	fmt.Println("Starting UBNT & Mikrotik Discovery...")
 
@@ -816,7 +955,6 @@ func main() {
 		}
 		listeners = append(listeners, pc)
 
-		// κρατάμε *net.UDPConn* για sendFromListeningPort
 		if uc, ok := pc.(*net.UDPConn); ok {
 			portUDPConns[port] = uc
 			_ = uc.SetReadBuffer(1 << 20)
@@ -835,7 +973,7 @@ func main() {
 		}(pc)
 	}
 
-	// ---- SSDP (239.255.255.250:1900) listeners on all multicast-capable ifaces ----
+	// ---- SSDP listeners on all multicast-capable ifaces ----
 	if ssdpConns, err := listenAllMulticast("239.255.255.250", 1900); err == nil {
 		for _, c := range ssdpConns {
 			wg.Add(1)
@@ -848,7 +986,7 @@ func main() {
 		fmt.Println("SSDP multicast failed:", err)
 	}
 
-	// ---- WS-Discovery (239.255.255.250:3702) ----
+	// ---- WS-Discovery ----
 	if wsdConns, err := listenAllMulticast("239.255.255.250", 3702); err == nil {
 		for _, c := range wsdConns {
 			wg.Add(1)
@@ -862,104 +1000,97 @@ func main() {
 	}
 
 	// -------------------------------------------------------
-	// Subnet Hunter (separate logs, dedup per-subnet & per-host)
+	// Subnet Hunter
 	// -------------------------------------------------------
 	fmt.Println("Starting Subnet Hunter on private ranges...")
 	results := make(chan discovery.HunterResult, 1024)
 
-	// producer: run hunter for each known private CIDR
+	// derive /24 CIDRs from local IPs & merge with KnownPrivateCIDRs
+	autoCIDRs := deriveLocalCIDRs(localIPs)
+	allCIDRs := uniqueCIDRs(KnownPrivateCIDRs, autoCIDRs)
+
+	// producer: run hunter for each CIDR (dedup μέσω scannedSubnets στον feeder)
 	go func() {
-		for _, cidr := range KnownPrivateCIDRs {
+		for _, cidr := range allCIDRs {
 			discovery.SubnetHunter(cidr, results)
 		}
 		close(results)
 	}()
 
-	// consumer: σταθερό worker-pool για ScanSubnet (bounded goroutines)
+	// consumer: bounded workers
 	const scanWorkers = 12
 	subnetQueue := make(chan string, scanWorkers*4)
 
-	// workers
-	var scanWG sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for subnet := range subnetQueue {
+			// συλλογή ευρημάτων & καθαρή εκτύπωση στο τέλος
+			items := make([]displayItem, 0, 64)
 
+			// “Pokes” πριν το scan ώστε να έρθουν γρήγορα replies στα listeners
+			pokeUBNTSubnet(subnet)
+			pokeMNDPSubnet(subnet)
 
-worker := func() {
-    defer scanWG.Done()
-    for subnet := range subnetQueue {
-        // Μαζεύουμε ευρήματα σε slice και τυπώνουμε ΜΟΝΟ στο τέλος (αν βρέθηκε κάτι)
-        items := make([]displayItem, 0, 64)
+			// Scan subnet
+			discovery.ScanSubnet(subnet, func(ip string) {
+				if !markNewHost(ip) {
+					return
+				}
 
-        // “Pokes” πριν το scan ώστε να έρθουν γρήγορα replies στα listeners
-        pokeUBNTSubnet(subnet)
-        pokeMNDPSubnet(subnet)
+				// στοχευμένα probes
+				probeUBNT(ip)
+				probeGrandstream(ip)
+				nudgeUBNTviaTCP(ip)
+				tcpProbeUBNT(ip, disc)
 
-        // Scan subnet
-        discovery.ScanSubnet(subnet, func(ip string) {
-            if !markNewHost(ip) {
-                return
-            }
+				// TCP fingerprint / κάμερες / ubnt / mikrotik
+				kind, hints := classifyByTCP(ip)
 
-            // Στέλνουμε στοχευμένα probes (δεν τυπώνουμε ακόμα τίποτα)
-            probeUBNT(ip)
-            probeGrandstream(ip)
-            nudgeUBNTviaTCP(ip)
-            tcpProbeUBNT(ip, disc)
+				if !isInteresting(kind, hints) {
+					return
+				}
 
-            // TCP-based ταξινόμηση/ενδείξεις
-            kind, hints := classifyByTCP(ip)
+				items = append(items, displayItem{
+					ip:    ip,
+					kind:  kind,
+					hints: hints,
+				})
+			})
 
-            // Αν δεν υπάρχει τίποτα ενδιαφέρον, μην ρυπαίνεις output
-            if !isInteresting(kind, hints) {
-                return
-            }
+			if len(items) == 0 {
+				continue
+			}
 
-            items = append(items, displayItem{
-                ip:    ip,
-                kind:  kind,
-                hints: hints,
-            })
-        })
+			sort.Slice(items, func(i, j int) bool {
+				ki, kj := kindOrder(items[i].kind), kindOrder(items[j].kind)
+				if ki != kj {
+					return ki < kj
+				}
+				return ipLess(items[i].ip, items[j].ip)
+			})
 
-        // Αν δεν βρέθηκε τίποτα, μην εκτυπώσεις block για το subnet
-        if len(items) == 0 {
-            continue
-        }
+			fmt.Printf("\n=== HUNTER Results for %s ===\n", subnet)
+			for _, it := range items {
+				line := fmt.Sprintf("[FINGERPRINT] %s -> %s", it.ip, it.kind)
+				if len(it.hints) > 0 {
+					line += " | " + strings.Join(it.hints, "; ")
+				}
+				if prev, _ := printedFP.Load(it.ip); prev != line {
+					fmt.Println(line)
+					printedFP.Store(it.ip, line)
+				}
+			}
+			fmt.Println("=== End HUNTER ===")
+		}
+	}
 
-        // Ταξινόμηση: πρώτα ανά είδος (MikroTik, UBNT, Unknown) κι έπειτα ανά IP
-        sort.Slice(items, func(i, j int) bool {
-            ki, kj := kindOrder(items[i].kind), kindOrder(items[j].kind)
-            if ki != kj {
-                return ki < kj
-            }
-            return ipLess(items[i].ip, items[j].ip)
-        })
-
-        // Εκτυπώσεις ΜΟΝΟ στο τέλος, καθαρά & ομαλά
-        fmt.Printf("\n=== HUNTER Results for %s ===\n", subnet)
-        for _, it := range items {
-            // Ενιαία, περιεκτική γραμμή· αποφεύγουμε σκέτα [HOST]
-            line := fmt.Sprintf("[FINGERPRINT] %s -> %s", it.ip, it.kind)
-            if len(it.hints) > 0 {
-                line += " | " + strings.Join(it.hints, "; ")
-            }
-            // Dedup ίδιου fingerprint για την IP (αν το έχεις ήδη)
-            if prev, _ := printedFP.Load(it.ip); prev != line {
-                fmt.Println(line)
-                printedFP.Store(it.ip, line)
-            }
-        }
-        fmt.Println("=== End HUNTER ===\n")
-    }
-}
-
-
-
-	scanWG.Add(scanWorkers)
+	// start workers
 	for i := 0; i < scanWorkers; i++ {
+		wg.Add(1)
 		go worker()
 	}
 
-	// feeder: διαβάζει από results και γεμίζει την ουρά χωρίς να φτιάχνει goroutines ανά result
+	// feeder: διαβάζει από results και γεμίζει την ουρά (dedup ανά subnet)
 	go func() {
 		for r := range results {
 			if _, loaded := scannedSubnets.LoadOrStore(r.Subnet, struct{}{}); loaded {
@@ -971,7 +1102,7 @@ worker := func() {
 	}()
 
 	// periodic discovery broadcasts
-	ticker := time.NewTicker(30 * time.Second) // λίγο πιο χαλαρά για να μην φορτώνει το δίκτυο
+	ticker := time.NewTicker(30 * time.Second) // χαλαρά για να μη φορτώνει το δίκτυο
 	defer ticker.Stop()
 	for {
 		sendDiscovery(disc)
