@@ -12,6 +12,7 @@ import (
 	"time"
 	"bytes"
 	"sort"
+	"net/url"
 
 	"ussdiscovery/discovery"
 )
@@ -63,14 +64,45 @@ func isInteresting(kind string, hints []string) bool {
     return len(hints) > 0
 }
 
+func ssdpShouldPrint(key string) bool {
+    if key == "" {
+        return false
+    }
+    now := time.Now()
+    if v, ok := seenSSDP.Load(key); ok {
+        if t, ok2 := v.(time.Time); ok2 {
+            if now.Sub(t) < ssdpSuppress { // εντός παραθύρου καταστολής
+                return false
+            }
+        }
+    }
+    seenSSDP.Store(key, now)
+    return true
+}
 
 func normUSN(s string) string {
-	s = strings.TrimSpace(s)
-	if i := strings.Index(s, "::"); i >= 0 { // keep the left part (UUID)
-		s = s[:i]
-	}
-	s = strings.TrimPrefix(strings.ToLower(s), "uuid:")
-	return s
+    s = strings.TrimSpace(strings.ToLower(s))
+    if i := strings.Index(s, "::"); i >= 0 {
+        s = s[:i] // κόψε ό,τι υπάρχει μετά το πρώτο '::'
+    }
+    s = strings.TrimPrefix(s, "uuid:")
+    return s
+}
+
+func ssdpKey(usn, location, lastIP string) string {
+    // 1) Προτίμησε normalized USN (σταθερό ανά device)
+    if k := normUSN(usn); k != "" {
+        return "usn:" + k
+    }
+    // 2) Αλλιώς πάρε host από Location (συνήθως IP)
+    if u, err := url.Parse(location); err == nil && u != nil && u.Hostname() != "" {
+        return "loc:" + u.Hostname()
+    }
+    // 3) Τελευταίο fallback: η IP που απάντησε
+    if lastIP != "" {
+        return "ip:" + lastIP
+    }
+    return ""
 }
 
 // ports we listen on for discovery replies
@@ -256,39 +288,44 @@ func listenAllMulticast(group string, port int) ([]*net.UDPConn, error) {
 	return conns, nil
 }
 
+var seenSSDP sync.Map // key=USN ή IP
+const ssdpSuppress = 10 * time.Minute // προαιρετικό: μην ξαναεκτυπώσεις πριν περάσει αυτό
+
 func listenSSDP(c *net.UDPConn, disc *Discovery) {
-	defer c.Close()
-	buf := make([]byte, 8192)
-	for {
-		n, _, err := c.ReadFromUDP(buf)
-		if err != nil {
-			return
-		}
-		lines := strings.Split(string(buf[:n]), "\r\n")
-		hdr := map[string]string{}
-		// πρώτη γραμμή μπορεί να είναι "NOTIFY * HTTP/1.1" ή "HTTP/1.1 200 OK"
-		for _, ln := range lines[1:] {
-			if i := strings.Index(ln, ":"); i > 0 {
-				k := strings.ToUpper(strings.TrimSpace(ln[:i]))
-				v := strings.TrimSpace(ln[i+1:])
-				hdr[k] = v
-			}
-		}
-		dev := &SSDPDevice{
-			USN:       hdr["USN"],
-			ST:        hdr["ST"],
-			Server:    hdr["SERVER"],
-			Location:  hdr["LOCATION"],
-			CacheCtrl: hdr["CACHE-CONTROL"],
-		}
-		if dev.USN == "" && dev.Location == "" {
-			continue
-		}
-		if disc.ProcessSSDP(dev) {
-			fmt.Printf("[SSDP] %s | ST=%s | Server=%s | Location=%s\n",
-				dev.USN, dev.ST, dev.Server, dev.Location)
-		}
-	}
+    defer c.Close()
+    buf := make([]byte, 8192)
+    for {
+        n, addr, err := c.ReadFromUDP(buf)
+        if err != nil {
+            return
+        }
+        lines := strings.Split(string(buf[:n]), "\r\n")
+        hdr := map[string]string{}
+        for _, ln := range lines[1:] {
+            if i := strings.Index(ln, ":"); i > 0 {
+                k := strings.ToUpper(strings.TrimSpace(ln[:i]))
+                v := strings.TrimSpace(ln[i+1:])
+                hdr[k] = v
+            }
+        }
+        dev := &SSDPDevice{
+            USN:       hdr["USN"],
+            ST:        hdr["ST"],
+            Server:    hdr["SERVER"],
+            Location:  hdr["LOCATION"],
+            CacheCtrl: hdr["CACHE-CONTROL"],
+            LastAddr:  addr.IP.String(),
+        }
+
+        // φτιάξε stable key & έλεγξε rate-limited dedup
+        key := ssdpKey(dev.USN, dev.Location, dev.LastAddr)
+        if !ssdpShouldPrint(key) {
+            continue
+        }
+
+        // μόνο IP — όσο πιο “στεγνό”, τόσο λιγότερο noise
+        fmt.Printf("[SSDP] %s\n", addr.IP.String())
+    }
 }
 
 var (
@@ -325,7 +362,11 @@ func listenWSD(c *net.UDPConn, disc *Discovery) {
 
 var KnownPrivateCIDRs = []string{
 	"10.23.140.0/24",
-	
+	"192.168.0.0/24",
+	"192.168.1.0/24",
+	"192.168.2.0/24",
+	"192.168.88.0/24",
+		
 	
 }
 
@@ -607,7 +648,14 @@ func sendDiscovery(disc *Discovery) {
 				Server:    hdr["SERVER"],
 				Location:  hdr["LOCATION"],
 				CacheCtrl: hdr["CACHE-CONTROL"],
+				LastAddr:  addr.IP.String(),
 			}
+			
+			key := ssdpKey(dev.USN, dev.Location, dev.LastAddr)
+if ssdpShouldPrint(key) {
+    fmt.Printf("[SSDP] %s\n", addr.IP.String())
+}
+
 			if dev.USN != "" || dev.Location != "" {
 				if disc.ProcessSSDP(dev) {
 					fmt.Printf("[SSDP] From=%s | %s | ST=%s | Server=%s | Location=%s\n",
