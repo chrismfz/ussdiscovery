@@ -275,7 +275,8 @@ func listenWSD(c *net.UDPConn, disc *Discovery) {
 
 var KnownPrivateCIDRs = []string{
 	"10.23.140.0/24",
-
+	
+	
 }
 
 var scannedSubnets sync.Map // subnet CIDR -> struct{}
@@ -352,6 +353,103 @@ func nudgeUBNTviaTCP(ip string) {
 	if isOpenTCP(net.JoinHostPort(ip, "10001"), 300*time.Millisecond) {
 		probeUBNT(ip)
 	}
+}
+
+// ---------------------------
+// NEW: TCP fingerprint helpers
+// ---------------------------
+
+// Γρήγορος TCP "is open?"
+func tcpOpen(ip string, port int, d time.Duration) bool {
+	c, err := net.DialTimeout("tcp", net.JoinHostPort(ip, fmt.Sprint(port)), d)
+	if err == nil {
+		_ = c.Close()
+		return true
+	}
+	return false
+}
+
+// Διάβασε SSH banner (μέχρι 64 bytes) χωρίς να στείλεις τίποτα
+func sshBanner(ip string, d time.Duration) (string, error) {
+	c, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "22"), d)
+	if err != nil {
+		return "", err
+	}
+	defer c.Close()
+	_ = c.SetReadDeadline(time.Now().Add(d))
+	buf := make([]byte, 64)
+	n, err := c.Read(buf)
+	if n > 0 {
+		return string(buf[:n]), nil
+	}
+	return "", err
+}
+
+// Πάρε HTTP Server header (HEAD /) σε 80
+func httpServerHeader(ip string, port int, d time.Duration) (string, error) {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, fmt.Sprint(port)), d)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(d))
+	req := "HEAD / HTTP/1.1\r\nHost: " + ip + "\r\nUser-Agent: ussdiscovery/1.0\r\nConnection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return "", err
+	}
+	buf := make([]byte, 1024)
+	n, _ := conn.Read(buf)
+	s := strings.ToLower(string(buf[:n]))
+	for _, line := range strings.Split(s, "\r\n") {
+		if strings.HasPrefix(line, "server:") {
+			return strings.TrimSpace(line[len("server:"):]), nil
+		}
+	}
+	return "", nil
+}
+
+func classifyByTCP(ip string) (kind string, hints []string) {
+	// 10001/tcp => ισχυρό hint για UBNT
+	if tcpOpen(ip, 10001, 250*time.Millisecond) {
+		hints = append(hints, "tcp/10001 open")
+		kind = "UBNT"
+	}
+
+	// SSH banner
+	if b, err := sshBanner(ip, 300*time.Millisecond); err == nil && b != "" {
+		lb := strings.ToLower(b)
+		if strings.Contains(lb, "rosssh") || strings.Contains(lb, "mikrotik") {
+			hints = append(hints, "ssh:"+strings.TrimSpace(b))
+			if kind == "" {
+				kind = "MikroTik"
+			}
+		} else {
+			hints = append(hints, "ssh:"+strings.TrimSpace(b))
+		}
+	}
+
+	// HTTP server header (80)
+	if srv, err := httpServerHeader(ip, 80, 400*time.Millisecond); err == nil && srv != "" {
+		ls := strings.ToLower(srv)
+		if strings.Contains(ls, "mikrotik") || strings.Contains(ls, "routeros") {
+			hints = append(hints, "http:server="+srv)
+			if kind == "" {
+				kind = "MikroTik"
+			}
+		} else if strings.Contains(ls, "ubnt") || strings.Contains(ls, "air") || strings.Contains(ls, "unifi") {
+			hints = append(hints, "http:server="+srv)
+			if kind == "" {
+				kind = "UBNT"
+			}
+		} else {
+			hints = append(hints, "http:server="+srv)
+		}
+	}
+
+	if kind == "" {
+		kind = "Unknown"
+	}
+	return
 }
 
 func sendDiscovery(disc *Discovery) {
@@ -643,6 +741,12 @@ func main() {
 
 					// προαιρετικό TCP nudge – αν 10001/tcp είναι open, ξαναστείλε UDP
 					nudgeUBNTviaTCP(ip)
+
+					// ---- TCP fingerprint fallback (cross-subnet friendly) ----
+					kind, hints := classifyByTCP(ip)
+					if kind != "Unknown" || len(hints) > 0 {
+						fmt.Printf("[FINGERPRINT] %s -> %s | %s\n", ip, kind, strings.Join(hints, "; "))
+					}
 				}
 			})
 
