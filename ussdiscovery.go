@@ -10,9 +10,59 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"bytes"
+	"sort"
 
 	"ussdiscovery/discovery"
 )
+
+// --- Pretty printing & sorting helpers ---
+
+type displayItem struct {
+    ip    string
+    kind  string   // MikroTik, UBNT, Unknown
+    hints []string // tcp/10001 open; ssh:...; http:server=...
+}
+
+func ipLess(a, b string) bool {
+    ipa := net.ParseIP(a)
+    ipb := net.ParseIP(b)
+    if ipa == nil || ipb == nil {
+        return a < b
+    }
+    // Προτιμάμε v4 πριν από v6, και μετά byte-compare
+    a4 := ipa.To4()
+    b4 := ipb.To4()
+    if (a4 != nil) != (b4 != nil) {
+        return a4 != nil // v4 πριν το v6
+    }
+    if a4 != nil && b4 != nil {
+        return bytes.Compare(a4, b4) < 0
+    }
+    return bytes.Compare(ipa, ipb) < 0
+}
+
+func kindOrder(kind string) int {
+    switch kind {
+    case "MikroTik":
+        return 0
+    case "UBNT":
+        return 1
+    default:
+        return 2
+    }
+}
+
+// Θεωρούμε “ουσιαστικό” fingerprint αν:
+// - αναγνωρίστηκε kind (UBNT/MikroTik) ή
+// - υπάρχουν hints με χρησιμότητα (ssh banner, http server, open ports)
+func isInteresting(kind string, hints []string) bool {
+    if kind != "Unknown" {
+        return true
+    }
+    return len(hints) > 0
+}
+
 
 func normUSN(s string) string {
 	s = strings.TrimSpace(s)
@@ -783,42 +833,78 @@ func main() {
 
 	// workers
 	var scanWG sync.WaitGroup
-	worker := func() {
-		defer scanWG.Done()
-		for subnet := range subnetQueue {
-			fmt.Printf("\n=== HUNTER Results for %s ===\n", subnet)
 
-			// NEW: στείλε broadcast “pokes” ώστε να έρθουν άμεσα απαντήσεις στα listeners
-			pokeUBNTSubnet(subnet) // UBNT discovery (UDP/10001) directed + global broadcast
-			pokeMNDPSubnet(subnet) // MikroTik MNDP (UDP/5678) directed + global broadcast
 
-			discovery.ScanSubnet(subnet, func(ip string) {
-				if markNewHost(ip) {
-					fmt.Printf("[HOST] %s\n", ip)
+worker := func() {
+    defer scanWG.Done()
+    for subnet := range subnetQueue {
+        // Μαζεύουμε ευρήματα σε slice και τυπώνουμε ΜΟΝΟ στο τέλος (αν βρέθηκε κάτι)
+        items := make([]displayItem, 0, 64)
 
-					// "Τάισμα" targeted probes: UBNT & Grandstream (FROM listening ports)
-					probeUBNT(ip)
-					probeGrandstream(ip)
+        // “Pokes” πριν το scan ώστε να έρθουν γρήγορα replies στα listeners
+        pokeUBNTSubnet(subnet)
+        pokeMNDPSubnet(subnet)
 
-					// προαιρετικό TCP nudge – αν 10001/tcp είναι open, ξαναστείλε UDP
-					nudgeUBNTviaTCP(ip)
+        // Scan subnet
+        discovery.ScanSubnet(subnet, func(ip string) {
+            if !markNewHost(ip) {
+                return
+            }
 
-					// Αν 10001/tcp είναι ανοιχτό, δοκίμασε και TCP-based UBNT discovery (cross-subnet)
-					tcpProbeUBNT(ip, disc)
+            // Στέλνουμε στοχευμένα probes (δεν τυπώνουμε ακόμα τίποτα)
+            probeUBNT(ip)
+            probeGrandstream(ip)
+            nudgeUBNTviaTCP(ip)
+            tcpProbeUBNT(ip, disc)
 
-					// ---- TCP fingerprint fallback (cross-subnet friendly) ----
-					kind, hints := classifyByTCP(ip)
-					line := fmt.Sprintf("[FINGERPRINT] %s -> %s | %s", ip, kind, strings.Join(hints, "; "))
-					if prev, _ := printedFP.Load(ip); prev != line {
-						fmt.Println(line)
-						printedFP.Store(ip, line)
-					}
-				}
-			})
+            // TCP-based ταξινόμηση/ενδείξεις
+            kind, hints := classifyByTCP(ip)
 
-			fmt.Println("=== End HUNTER ===\n")
-		}
-	}
+            // Αν δεν υπάρχει τίποτα ενδιαφέρον, μην ρυπαίνεις output
+            if !isInteresting(kind, hints) {
+                return
+            }
+
+            items = append(items, displayItem{
+                ip:    ip,
+                kind:  kind,
+                hints: hints,
+            })
+        })
+
+        // Αν δεν βρέθηκε τίποτα, μην εκτυπώσεις block για το subnet
+        if len(items) == 0 {
+            continue
+        }
+
+        // Ταξινόμηση: πρώτα ανά είδος (MikroTik, UBNT, Unknown) κι έπειτα ανά IP
+        sort.Slice(items, func(i, j int) bool {
+            ki, kj := kindOrder(items[i].kind), kindOrder(items[j].kind)
+            if ki != kj {
+                return ki < kj
+            }
+            return ipLess(items[i].ip, items[j].ip)
+        })
+
+        // Εκτυπώσεις ΜΟΝΟ στο τέλος, καθαρά & ομαλά
+        fmt.Printf("\n=== HUNTER Results for %s ===\n", subnet)
+        for _, it := range items {
+            // Ενιαία, περιεκτική γραμμή· αποφεύγουμε σκέτα [HOST]
+            line := fmt.Sprintf("[FINGERPRINT] %s -> %s", it.ip, it.kind)
+            if len(it.hints) > 0 {
+                line += " | " + strings.Join(it.hints, "; ")
+            }
+            // Dedup ίδιου fingerprint για την IP (αν το έχεις ήδη)
+            if prev, _ := printedFP.Load(it.ip); prev != line {
+                fmt.Println(line)
+                printedFP.Store(it.ip, line)
+            }
+        }
+        fmt.Println("=== End HUNTER ===\n")
+    }
+}
+
+
 
 	scanWG.Add(scanWorkers)
 	for i := 0; i < scanWorkers; i++ {
