@@ -22,6 +22,6 @@ It’s named after the **USS Discovery** (Star Trek) and **Ubiquiti Discovery Pr
 ## 📥 Installation
 
 ```bash
-git clone https://github.com/yourname/ussdiscovery.git
+git clone https://github.com/chrismfz/ussdiscovery.git
 cd ussdiscovery
 go build -o ussdiscovery
